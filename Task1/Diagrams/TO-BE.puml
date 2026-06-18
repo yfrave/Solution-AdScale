@@ -1,0 +1,109 @@
+@startuml AdScale_TO_BE_C4_Container
+
+!include style/container/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Container — TO-BE архитектура AdScale через год
+
+Person_Ext(dsp, "DSP-партнёр", "Отправляет рекламные запросы")
+Person(user, "Пользователь сайта/приложения", "Видит рекламу и кликает по баннерам")
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами и смотрит отчёты")
+
+System_Ext(paymentGateway, "Платёжный шлюз", "Обрабатывает пополнение бюджета")
+
+System_Boundary(adscale, "AdScale Platform") {
+
+Container(gateway, "Gateway", "Nginx / API Gateway", "Единая точка входа для внешних запросов")
+
+Container(auctionService, "Сервис рекламного аукциона", "C++ / Go", "Выбирает победителя аукциона. Использует Redis вместо обращения к PostgreSQL в критическом пути")
+
+Container(deliveryService, "Delivery Service", "Node.js", "Формирует рекламный ответ и баннер")
+
+Container(campaignService, "Сервис кампаний", "Go / Node.js", "Создание кампаний, ставки, таргетинг, статусы кампаний")
+ContainerDb(campaignDb, "campaign_db", "PostgreSQL", "Кампании, ставки, таргетинг")
+
+Container(statisticsService, "Сервис статистики", "Python / Go", "Принимает показы, клики и конверсии")
+Container(statisticsWorker, "Обработчик статистики", "Python / Go", "Читает события из Kafka и готовит данные для аналитики")
+
+Container(financeService, "Сервис финансов", "Go", "Балансы, списания, пополнения и счета")
+ContainerDb(billingDb, "billing_db", "PostgreSQL", "Балансы, списания, счета, история операций")
+
+Container(analyticsService, "Сервис аналитики", "Python", "Отдаёт отчёты рекламодателям")
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Данные для аналитики и отчётов")
+
+ContainerDb(redis, "Redis", "Redis", "Быстрые данные для аукциона: активные кампании, ставки, бюджеты")
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "События показов, кликов, конверсий, изменений кампаний и финансов")
+
+
+}
+
+Rel(dsp, gateway, "Рекламный запрос", "HTTPS / OpenRTB")
+Rel(user, gateway, "Показы и клики", "HTTPS")
+Rel(advertiser, gateway, "Управление кампаниями, бюджетами и отчётами", "HTTPS")
+
+Rel(gateway, auctionService, "Передаёт рекламный запрос", "HTTP")
+Rel(auctionService, redis, "Читает данные для аукциона", "Redis")
+Rel(auctionService, deliveryService, "Передаёт победителя аукциона", "HTTP")
+Rel(deliveryService, gateway, "Возвращает рекламный ответ", "HTTP")
+
+Rel(gateway, campaignService, "Создание и изменение кампаний", "HTTP")
+Rel(campaignService, campaignDb, "Читает и сохраняет кампании", "SQL")
+Rel(campaignService, kafka, "Публикует изменения кампаний", "Kafka")
+Rel(kafka, redis, "Обновляет данные для аукциона", "Kafka consumer")
+
+Rel(gateway, statisticsService, "Передаёт показы, клики и конверсии", "HTTP")
+Rel(statisticsService, kafka, "Публикует события статистики", "Kafka")
+Rel(kafka, statisticsWorker, "Читает события статистики", "Kafka consumer")
+Rel(statisticsWorker, clickhouse, "Записывает подготовленные данные", "SQL / batch insert")
+
+Rel(gateway, financeService, "Пополнение бюджета и финансовые операции", "HTTP")
+Rel(financeService, paymentGateway, "Проводит платёж", "HTTPS")
+Rel(financeService, billingDb, "Сохраняет балансы и операции", "SQL")
+Rel(financeService, kafka, "Публикует финансовые события", "Kafka")
+Rel(kafka, redis, "Обновляет бюджеты для аукциона", "Kafka consumer")
+
+Rel(gateway, analyticsService, "Запрос отчётов", "HTTP")
+Rel(analyticsService, clickhouse, "Читает данные для отчётов", "SQL")
+
+note right of auctionService
+Граница выделена из-за требования
+по времени ответа.
+
+Аукцион находится в критическом пути,
+поэтому он должен масштабироваться отдельно
+и не ждать PostgreSQL.
+end note
+
+note right of campaignService
+Граница выделена по бизнес-логике
+управления рекламными кампаниями.
+
+Кампании, ставки и таргетинг
+хранятся отдельно.
+end note
+
+note right of statisticsService
+Граница выделена из-за большого
+потока событий.
+
+Показы и клики не пишутся
+напрямую в PostgreSQL.
+end note
+
+note right of financeService
+Граница выделена из-за финансовой
+ответственности.
+
+Балансы и списания должны быть
+отделены от статистики и аналитики.
+end note
+
+note right of analyticsService
+Граница выделена из-за тяжёлых отчётов.
+
+Отчёты читаются из ClickHouse,
+а не из основной PostgreSQL.
+end note
+
+@enduml
