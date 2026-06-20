@@ -1,0 +1,96 @@
+@startuml Bidding_Component
+
+!include style/component/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title C4 Component — Bidding Service и зависимости
+
+System_Ext(dsp, "Новая DSP", "Отправляет bid request и получает bid response")
+
+System_Boundary(adscale, "AdScale RTB контур") {
+
+Container(gateway, "DSP Gateway", "Nginx / API Gateway", "Auth, rate limit, timeout, circuit breaker, маршрутизация")
+
+Container_Boundary(bidding, "Bidding Service") {
+
+    Component(bidApi, "Bid API", "gRPC endpoint", "Принимает внутренний запрос CalculateBid от Gateway")
+
+    Component(validator, "Request Validator", "Component", "Проверяет обязательные поля и формат запроса")
+
+    Component(selector, "Campaign Selector", "Component", "Подбирает подходящие кампании из быстрых данных")
+
+    Component(targeting, "Targeting Matcher", "Component", "Проверяет правила таргетинга")
+
+    Component(budgetGuard, "Budget Guard", "Component", "Проверяет доступный бюджет по данным из Redis")
+
+    Component(calculator, "Bid Calculator", "Component", "Рассчитывает итоговую ставку")
+
+    Component(responseBuilder, "Response Builder", "Component", "Формирует bid response или no-bid response")
+
+    Component(eventPublisher, "Event Publisher", "Component", "Публикует технические события в Kafka")
+}
+
+ContainerDb(redis, "Redis", "Redis", "Активные кампании, ставки, таргетинг, лимиты и бюджеты")
+
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "События ставок, показов, кликов, изменений кампаний и бюджетов")
+
+Container(campaignService, "Campaign Service", "Go / Node.js", "Управляет кампаниями, ставками и таргетингом")
+
+Container(billingService, "Billing Service", "Go", "Управляет балансами и финансовыми операциями")
+
+Container(cacheUpdater, "Cache Updater", "Worker", "Обновляет Redis по событиям из Kafka")
+
+Container(statsWorker, "Tracking / Statistics Worker", "Python / Go", "Обрабатывает события для статистики")
+
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Данные для аналитики и отчётов")
+
+}
+
+Rel(dsp, gateway, "bid request", "HTTPS / OpenRTB JSON")
+Rel(gateway, bidApi, "CalculateBid", "gRPC")
+
+Rel(bidApi, validator, "validate")
+Rel(validator, selector, "valid request")
+Rel(selector, redis, "read CampaignBidData", "Redis")
+Rel(selector, targeting, "candidates")
+Rel(targeting, budgetGuard, "matched campaigns")
+Rel(budgetGuard, redis, "read budget data", "Redis")
+Rel(budgetGuard, calculator, "allowed campaigns")
+Rel(calculator, responseBuilder, "bid decision")
+Rel(responseBuilder, gateway, "bid / no-bid response", "gRPC")
+
+Rel(bidApi, eventPublisher, "result event")
+Rel(eventPublisher, kafka, "bid.response.sent / bid.no_bid / bid.error", "Kafka")
+
+Rel(campaignService, kafka, "campaign.changed", "Kafka")
+Rel(billingService, kafka, "budget.changed", "Kafka")
+
+Rel(kafka, cacheUpdater, "read campaign and budget events", "Kafka consumer")
+Rel(cacheUpdater, redis, "update fast read model", "Redis")
+
+Rel(kafka, statsWorker, "read bid / click / impression events", "Kafka consumer")
+Rel(statsWorker, clickhouse, "write prepared analytics data", "SQL / batch insert")
+
+note right of bidding
+Bidding Service не ходит в PostgreSQL
+при обработке bid request.
+
+В критическом пути используются:
+Gateway -> gRPC -> Bidding Service -> Redis.
+end note
+
+note bottom of kafka
+Kafka используется для событий,
+которые не должны задерживать
+ответ DSP.
+end note
+
+note bottom of gateway
+Gateway защищает Bidding Service:
+auth, rate limit, timeout,
+circuit breaker и метрики.
+end note
+
+@enduml

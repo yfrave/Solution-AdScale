@@ -1,0 +1,91 @@
+@startuml Data_Architecture
+
+!include style/container/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title Task3 — Data Architecture для AdScale
+
+System_Ext(dsp, "DSP", "Внешняя DSP-площадка")
+Person_Ext(advertiser, "Рекламодатель", "Управляет кампаниями и смотрит отчёты")
+
+System_Boundary(adscale, "AdScale") {
+
+Container(gateway, "DSP Gateway", "API Gateway", "Принимает bid request от DSP, проверяет доступ, применяет rate limit")
+Container(dashboard, "Advertiser Dashboard", "Web UI", "Кабинет рекламодателя")
+
+Container(bidding, "Bidding Service", "Go / C++", "Рассчитывает ставку для bid request")
+Container(campaign, "Campaign Service", "Go / Node.js", "Управляет кампаниями, ставками, таргетингом и креативами")
+Container(billing, "Billing Service", "Go", "Управляет балансами, списаниями и финансовыми операциями")
+Container(tracking, "Tracking / Statistics Service", "Python / Go", "Принимает события показов, кликов и конверсий")
+Container(analytics, "Analytics Service", "Python / Go", "Строит отчёты для рекламодателей")
+
+Container(cacheUpdater, "Cache Updater", "Worker", "Обновляет Redis по событиям из Kafka")
+Container(statsWorker, "Statistics Worker", "Worker", "Обрабатывает события и пишет подготовленные данные в ClickHouse")
+
+ContainerDb(redis, "Redis Cluster", "Redis", "Read-модель для ставок: кампании, ставки, таргетинг, бюджеты")
+ContainerDb(campaignDb, "campaign_db", "PostgreSQL", "Кампании, ставки, таргетинг, креативы, статусы")
+ContainerDb(billingDb, "billing_db", "PostgreSQL", "Балансы, списания, платежи, счета, operation_id")
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "Bid, impression, click, campaign, budget и billing events")
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Показы, клики, конверсии, агрегации и отчёты")
+
+}
+
+Rel(dsp, gateway, "Отправляет bid request", "HTTPS / OpenRTB JSON")
+Rel(gateway, bidding, "CalculateBid", "gRPC")
+
+Rel(advertiser, dashboard, "Работает с кампаниями и отчётами", "HTTPS")
+Rel(dashboard, campaign, "Управление кампаниями", "REST")
+Rel(dashboard, billing, "Управление балансом", "REST")
+Rel(dashboard, analytics, "Просмотр отчётов", "REST")
+
+Rel(bidding, redis, "Читает быстрые данные для расчёта ставки", "Redis")
+Rel(bidding, kafka, "Публикует bid events", "Kafka")
+
+Rel(campaign, campaignDb, "Читает и пишет кампании", "SQL")
+Rel(campaign, kafka, "Публикует campaign-events", "Kafka")
+
+Rel(billing, billingDb, "Читает и пишет финансовые данные", "SQL")
+Rel(billing, kafka, "Публикует budget-events и billing-events", "Kafka")
+
+Rel(tracking, kafka, "Публикует impression/click/conversion events", "Kafka")
+
+Rel(kafka, cacheUpdater, "Передаёт campaign/budget events", "Kafka consumer")
+Rel(cacheUpdater, redis, "Обновляет read-модель", "Redis")
+
+Rel(kafka, statsWorker, "Передаёт bid/click/impression events", "Kafka consumer")
+Rel(statsWorker, clickhouse, "Записывает подготовленные данные", "SQL / batch insert")
+
+Rel(analytics, clickhouse, "Читает отчёты и агрегации", "SQL")
+
+note right of bidding
+Bidding Service не обращается
+к PostgreSQL при обработке bid request.
+
+В критическом пути:
+DSP Gateway -> Bidding Service -> Redis.
+end note
+
+note bottom of campaignDb
+Campaign Service владеет campaign_db.
+
+Другие сервисы не должны читать
+эту БД напрямую.
+end note
+
+note bottom of billingDb
+Billing Service владеет billing_db.
+
+Финансовые операции должны быть
+идемпотентны через operation_id.
+end note
+
+note bottom of clickhouse
+ClickHouse используется для аналитики.
+
+Отчёты не должны нагружать
+рабочие PostgreSQL-базы.
+end note
+
+@enduml

@@ -1,0 +1,112 @@
+@startuml Kafka_Streaming
+
+!include style/container/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title Task3 — Kafka Event Streaming для AdScale
+
+System_Boundary(producers, "Producers") {
+Container(bidding, "Bidding Service", "Go / C++", "Публикует события ставок")
+Container(tracking, "Tracking / Statistics Service", "Python / Go", "Публикует показы, клики и конверсии")
+Container(campaign, "Campaign Service", "Go / Node.js", "Публикует изменения кампаний")
+Container(billing, "Billing Service", "Go", "Публикует изменения бюджетов и финансовые события")
+}
+
+System_Boundary(kafkaBoundary, "Kafka Topics") {
+ContainerQueue(bidEvents, "bid-events", "Kafka topic", "key: request_id / dsp_id, retention: 7 days")
+ContainerQueue(impressionEvents, "impression-events", "Kafka topic", "key: campaign_id, retention: 14-30 days")
+ContainerQueue(clickEvents, "click-events", "Kafka topic", "key: campaign_id, retention: 14-30 days")
+ContainerQueue(conversionEvents, "conversion-events", "Kafka topic", "key: campaign_id, retention: 30 days")
+ContainerQueue(campaignEvents, "campaign-events", "Kafka topic", "key: campaign_id, retention: 30-90 days")
+ContainerQueue(budgetEvents, "budget-events", "Kafka topic", "key: advertiser_id, retention: 30-90 days")
+ContainerQueue(billingEvents, "billing-events", "Kafka topic", "key: operation_id, retention: 90+ days")
+ContainerQueue(dlqEvents, "dlq-events", "Kafka topic", "Ошибочные события после retry")
+}
+
+System_Boundary(consumers, "Consumers") {
+Container(cacheUpdater, "cache-updater-group", "Kafka consumer group", "Обновляет Redis")
+Container(statsWorker, "statistics-worker-group", "Kafka consumer group", "Готовит статистику и пишет данные в ClickHouse")
+Container(billingWorker, "billing-worker-group", "Kafka consumer group", "Обрабатывает финансовые события")
+Container(analyticsLoader, "analytics-loader-group", "Kafka consumer group", "Загружает данные для отчётов")
+Container(monitoring, "monitoring-group", "Kafka consumer group", "Считает технические метрики")
+Container(dlqHandler, "dlq-handler-group", "Kafka consumer group", "Разбирает ошибочные события")
+}
+
+System_Boundary(storages, "Storages") {
+ContainerDb(redis, "Redis Cluster", "Redis", "Read-модель для Bidding Service")
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Аналитика и отчёты")
+ContainerDb(billingDb, "billing_db", "PostgreSQL", "Финансовые операции")
+}
+
+Rel(bidding, bidEvents, "bid.request.received, bid.response.sent, bid.no_bid, bid.error", "Kafka")
+Rel(tracking, impressionEvents, "impression.created", "Kafka")
+Rel(tracking, clickEvents, "click.created", "Kafka")
+Rel(tracking, conversionEvents, "conversion.created", "Kafka")
+
+Rel(campaign, campaignEvents, "campaign.created, campaign.updated, campaign.paused, campaign.deleted", "Kafka")
+Rel(billing, budgetEvents, "budget.changed", "Kafka")
+Rel(billing, billingEvents, "payment.completed, payment.failed, money.charged, invoice.created", "Kafka")
+
+Rel(campaignEvents, cacheUpdater, "consume", "Kafka")
+Rel(budgetEvents, cacheUpdater, "consume", "Kafka")
+Rel(cacheUpdater, redis, "Обновляет campaign/budget cache", "Redis")
+
+Rel(bidEvents, statsWorker, "consume", "Kafka")
+Rel(impressionEvents, statsWorker, "consume", "Kafka")
+Rel(clickEvents, statsWorker, "consume", "Kafka")
+Rel(conversionEvents, statsWorker, "consume", "Kafka")
+Rel(statsWorker, clickhouse, "Записывает подготовленную статистику", "SQL / batch insert")
+
+Rel(impressionEvents, billingWorker, "consume", "Kafka")
+Rel(clickEvents, billingWorker, "consume", "Kafka")
+Rel(billingEvents, billingWorker, "consume", "Kafka")
+Rel(billingWorker, billingDb, "Идемпотентная обработка", "SQL")
+
+Rel(bidEvents, analyticsLoader, "consume", "Kafka")
+Rel(impressionEvents, analyticsLoader, "consume", "Kafka")
+Rel(clickEvents, analyticsLoader, "consume", "Kafka")
+Rel(conversionEvents, analyticsLoader, "consume", "Kafka")
+Rel(analyticsLoader, clickhouse, "Загружает данные для отчётов", "SQL / batch insert")
+
+Rel(bidEvents, monitoring, "consume", "Kafka")
+Rel(impressionEvents, monitoring, "consume", "Kafka")
+Rel(clickEvents, monitoring, "consume", "Kafka")
+Rel(campaignEvents, monitoring, "consume", "Kafka")
+Rel(budgetEvents, monitoring, "consume", "Kafka")
+Rel(billingEvents, monitoring, "consume", "Kafka")
+
+Rel(bidEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(impressionEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(clickEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(campaignEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(budgetEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(billingEvents, dlqEvents, "failed after retry", "Kafka")
+
+Rel(dlqEvents, dlqHandler, "Разбор ошибок", "Kafka")
+
+note bottom of kafkaBoundary
+Формат событий: JSON Schema.
+
+Общие поля:
+event_id, event_type,
+event_version, occurred_at,
+producer, correlation_id, payload.
+end note
+
+note right of billingWorker
+Финансовые события
+обрабатываются идемпотентно.
+
+operation_id защищает
+от повторного списания.
+end note
+
+note bottom of dlqEvents
+DLQ нужен, чтобы одно плохое
+событие не блокировало
+обработку всего потока.
+end note
+
+@enduml
