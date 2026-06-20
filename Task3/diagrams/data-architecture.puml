@@ -1,0 +1,125 @@
+@startuml Data_Architecture
+
+!include style/container/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title Task3 — Data Architecture для AdScale
+
+System_Ext(dsp, "DSP", "Внешняя DSP-площадка")
+Person_Ext(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетом и смотрит отчёты")
+Person_Ext(admin, "Администратор", "Управляет пользователями, ролями и DSP-партнёрами")
+
+System_Boundary(adscale, "AdScale") {
+
+Container(gateway, "DSP Gateway", "API Gateway", "Принимает внешние запросы, проверяет доступ, применяет rate limit и маршрутизирует запросы")
+Container(dashboard, "Advertiser Dashboard", "Web UI", "Кабинет рекламодателя")
+
+Container(auth, "Auth Service", "Go", "Пользователи, роли, JWT, refresh tokens и API keys для DSP-партнёров")
+Container(bidding, "Bidding Service", "Go", "Рассчитывает ставку для bid request")
+Container(campaign, "Campaign Service", "Go", "Управляет кампаниями, ставками, таргетингом и креативами")
+Container(billing, "Billing Service", "Go", "Управляет балансами, списаниями и финансовыми операциями")
+Container(tracking, "Tracking / Statistics Service", "Go", "Принимает события показов, кликов и конверсий")
+Container(analytics, "Analytics Service", "Go", "Строит отчёты для рекламодателей")
+
+Container(authCacheUpdater, "Auth Cache Updater", "Go worker", "Обновляет кэш DSP credentials на Gateway по событиям из Kafka")
+Container(cacheUpdater, "Cache Updater", "Go worker", "Обновляет Redis по событиям кампаний и бюджетов из Kafka")
+Container(statsWorker, "Statistics Worker", "Go worker", "Обрабатывает события и пишет подготовленные данные в ClickHouse")
+
+ContainerDb(gatewayCredentialsCache, "Gateway credentials cache", "In-memory cache", "Read-модель DSP credentials для быстрой проверки bid request на Gateway")
+ContainerDb(redis, "Redis Cluster", "Redis", "Read-модель для ставок: кампании, ставки, таргетинг, бюджеты")
+ContainerDb(authDb, "auth_db", "PostgreSQL", "Пользователи, роли, права доступа, refresh tokens, DSP API keys")
+ContainerDb(campaignDb, "campaign_db", "PostgreSQL", "Кампании, ставки, таргетинг, креативы, статусы")
+ContainerDb(billingDb, "billing_db", "PostgreSQL", "Балансы, списания, платежи, счета, operation_id")
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "Bid, impression, click, campaign, budget, billing и auth events")
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Показы, клики, конверсии, агрегации и отчёты")
+
+}
+
+Rel(dsp, gateway, "Отправляет bid request", "HTTPS / OpenRTB JSON")
+Rel(gateway, gatewayCredentialsCache, "Проверяет DSP credentials", "local cache lookup")
+Rel(gateway, bidding, "CalculateBid", "gRPC")
+
+Rel(advertiser, dashboard, "Работает с кампаниями и отчётами", "HTTPS")
+Rel(admin, dashboard, "Управляет пользователями и DSP-партнёрами", "HTTPS")
+
+Rel(dashboard, gateway, "Запросы личного кабинета", "HTTPS")
+Rel(gateway, auth, "Login, refresh token, управление доступами", "REST")
+Rel(gateway, campaign, "Управление кампаниями", "REST")
+Rel(gateway, billing, "Управление балансом", "REST")
+Rel(gateway, analytics, "Просмотр отчётов", "REST")
+
+Rel(auth, authDb, "Читает и пишет пользователей, роли и DSP API keys", "SQL")
+Rel(auth, kafka, "Публикует auth.credentials.changed и access events", "Kafka")
+Rel(kafka, authCacheUpdater, "Передаёт auth credentials events", "Kafka consumer")
+Rel(authCacheUpdater, gatewayCredentialsCache, "Обновляет read-модель DSP credentials", "cache update")
+
+Rel(bidding, redis, "Читает быстрые данные для расчёта ставки", "Redis")
+Rel(bidding, kafka, "Публикует bid events", "Kafka")
+
+Rel(campaign, campaignDb, "Читает и пишет кампании", "SQL")
+Rel(campaign, kafka, "Публикует campaign-events", "Kafka")
+
+Rel(billing, billingDb, "Читает и пишет финансовые данные", "SQL")
+Rel(billing, kafka, "Публикует budget-events и billing-events", "Kafka")
+
+Rel(tracking, kafka, "Публикует impression/click/conversion events", "Kafka")
+
+Rel(kafka, cacheUpdater, "Передаёт campaign/budget events", "Kafka consumer")
+Rel(cacheUpdater, redis, "Обновляет read-модель для Bidding Service", "Redis")
+
+Rel(kafka, statsWorker, "Передаёт bid/click/impression/conversion events", "Kafka consumer")
+Rel(statsWorker, clickhouse, "Записывает подготовленные данные", "SQL / batch insert")
+
+Rel(analytics, clickhouse, "Читает отчёты и агрегации", "SQL")
+
+note right of gateway
+Gateway проверяет DSP credentials
+по локальному кэшу.
+
+Он не должен синхронно обращаться
+в Auth Service на каждый bid request,
+иначе это увеличит задержку
+в критическом пути.
+end note
+
+note right of auth
+Auth Service владеет auth_db.
+
+Он является источником истины
+для пользователей, ролей,
+JWT, refresh tokens и DSP API keys.
+end note
+
+note right of bidding
+Bidding Service не обращается
+к PostgreSQL и Auth Service
+при обработке bid request.
+
+В критическом пути:
+DSP Gateway -> credentials cache -> Bidding Service -> Redis.
+end note
+
+note bottom of campaignDb
+Campaign Service владеет campaign_db.
+
+Другие сервисы не должны читать
+эту БД напрямую.
+end note
+
+note bottom of billingDb
+Billing Service владеет billing_db.
+
+Финансовые операции должны быть
+идемпотентны через operation_id.
+end note
+
+note bottom of clickhouse
+ClickHouse используется для аналитики.
+
+Отчёты не должны нагружать
+рабочие PostgreSQL-базы.
+end note
+
+@enduml

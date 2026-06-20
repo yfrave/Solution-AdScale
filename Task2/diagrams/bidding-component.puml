@@ -1,0 +1,138 @@
+@startuml Bidding_Component
+
+!include style/component/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title C4 Component — Bidding Service и зависимости
+
+System_Ext(dsp, "Новая DSP", "Отправляет bid request и получает bid response")
+
+System_Boundary(adscale, "AdScale RTB контур") {
+
+Container(gateway, "DSP Gateway", "API Gateway", "Проверяет DSP credentials по локальному кэшу, применяет rate limit, timeout, circuit breaker и маршрутизацию")
+
+Container(gatewayCredentialsCache, "Gateway credentials cache", "In-memory cache", "Быстрая read-модель DSP credentials для проверки bid request на Gateway")
+
+Container(authService, "Auth Service", "Go", "Пользователи, роли, JWT, refresh tokens и API keys для DSP-партнёров")
+
+ContainerDb(authDb, "auth_db", "PostgreSQL", "Пользователи, роли, права доступа, refresh tokens, DSP API keys")
+
+Container(authCacheUpdater, "Auth Cache Updater", "Go worker", "Обновляет кэш Gateway по событиям изменения DSP credentials")
+
+Container_Boundary(bidding, "Bidding Service") {
+
+    Component(bidApi, "Bid API", "Go component / gRPC endpoint", "Принимает внутренний запрос CalculateBid от Gateway")
+
+    Component(validator, "Request Validator", "Go component", "Проверяет обязательные поля и формат запроса")
+
+    Component(selector, "Campaign Selector", "Go component", "Подбирает подходящие кампании из быстрых данных")
+
+    Component(targeting, "Targeting Matcher", "Go component", "Проверяет правила таргетинга")
+
+    Component(budgetGuard, "Budget Guard", "Go component", "Проверяет доступный бюджет по данным из Redis")
+
+    Component(calculator, "Bid Calculator", "Go component", "Рассчитывает итоговую ставку")
+
+    Component(responseBuilder, "Response Builder", "Go component", "Формирует bid response или no-bid response")
+
+    Component(eventPublisher, "Event Publisher", "Go component", "Публикует технические события в Kafka")
+}
+
+ContainerDb(redis, "Redis", "Redis Cluster", "Активные кампании, ставки, таргетинг, лимиты и бюджеты")
+
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "События ставок, показов, кликов, изменений кампаний, бюджетов и доступов")
+
+Container(campaignService, "Campaign Service", "Go", "Управляет кампаниями, ставками и таргетингом")
+
+Container(billingService, "Billing Service", "Go", "Управляет балансами и финансовыми операциями")
+
+Container(cacheUpdater, "Cache Updater", "Go worker", "Обновляет Redis по событиям кампаний и бюджетов из Kafka")
+
+Container(statsWorker, "Tracking / Statistics Worker", "Go worker", "Обрабатывает события для статистики")
+
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Данные для аналитики и отчётов")
+
+}
+
+Rel(dsp, gateway, "bid request", "HTTPS / OpenRTB JSON")
+
+Rel(gateway, gatewayCredentialsCache, "Проверяет DSP credentials", "local cache lookup")
+Rel(gateway, bidApi, "CalculateBid", "gRPC")
+
+Rel(authService, authDb, "Читает и сохраняет пользователей, роли и DSP API keys", "SQL")
+Rel(authService, kafka, "Публикует auth.credentials.changed", "Kafka")
+Rel(kafka, authCacheUpdater, "read auth credentials events", "Kafka consumer")
+Rel(authCacheUpdater, gatewayCredentialsCache, "update DSP credentials read model", "cache update")
+
+Rel(bidApi, validator, "validate")
+Rel(validator, selector, "valid request")
+Rel(selector, redis, "read CampaignBidData", "Redis")
+Rel(selector, targeting, "candidates")
+Rel(targeting, budgetGuard, "matched campaigns")
+Rel(budgetGuard, redis, "read budget data", "Redis")
+Rel(budgetGuard, calculator, "allowed campaigns")
+Rel(calculator, responseBuilder, "bid decision")
+Rel(responseBuilder, gateway, "bid / no-bid response", "gRPC")
+
+Rel(bidApi, eventPublisher, "result event")
+Rel(eventPublisher, kafka, "bid.response.sent / bid.no_bid / bid.error", "Kafka")
+
+Rel(campaignService, kafka, "campaign.changed", "Kafka")
+Rel(billingService, kafka, "budget.changed", "Kafka")
+
+Rel(kafka, cacheUpdater, "read campaign and budget events", "Kafka consumer")
+Rel(cacheUpdater, redis, "update fast read model", "Redis")
+
+Rel(kafka, statsWorker, "read bid / click / impression events", "Kafka consumer")
+Rel(statsWorker, clickhouse, "write prepared analytics data", "SQL / batch insert")
+
+note right of gateway
+Gateway проверяет DSP credentials
+по локальному кэшу.
+
+Он не должен синхронно обращаться
+в Auth Service на каждый bid request,
+иначе это увеличит задержку
+в критическом пути.
+end note
+
+note right of authService
+Auth Service является источником истины
+для пользователей, ролей, JWT,
+refresh tokens и DSP API keys.
+
+API keys не должны храниться
+в коде или репозитории.
+В базе лучше хранить hash ключа
+или защищённое представление.
+end note
+
+note right of bidding
+Bidding Service не ходит в PostgreSQL
+и не обращается в Auth Service
+при обработке bid request.
+
+В критическом пути используются:
+Gateway -> credentials cache -> gRPC -> Bidding Service -> Redis.
+end note
+
+note bottom of kafka
+Kafka используется для событий,
+которые не должны задерживать
+ответ DSP.
+
+Через Kafka также обновляется
+кэш DSP credentials на Gateway.
+end note
+
+note bottom of redis
+Redis хранит read-модель
+для быстрого расчёта ставки.
+
+Источники истины:
+Campaign Service и Billing Service.
+end note
+
+@enduml
