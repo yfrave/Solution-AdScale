@@ -1,0 +1,146 @@
+@startuml AdScale_TO_BE_C4_Container
+
+!include style/container/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title C4 Container — TO-BE архитектура AdScale через год
+
+Person_Ext(dsp, "DSP-партнёр", "Отправляет рекламные запросы")
+Person(user, "Пользователь сайта/приложения", "Видит рекламу и кликает по баннерам")
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами и смотрит отчёты")
+Person(admin, "Администратор", "Управляет DSP-партнёрами, пользователями и доступами")
+
+System_Ext(paymentGateway, "Платёжный шлюз", "Обрабатывает пополнение бюджета")
+
+System_Boundary(adscale, "AdScale Platform") {
+
+Container(gateway, "Gateway", "Nginx / API Gateway", "Единая точка входа для внешних запросов, rate limit, проверка токенов и DSP credentials")
+
+Container(authService, "Auth Service", "Go", "Пользователи, роли, JWT, refresh tokens и API keys для DSP-партнёров")
+ContainerDb(authDb, "auth_db", "PostgreSQL", "Пользователи, роли, права доступа, refresh tokens, DSP API keys")
+
+ContainerDb(gatewayCredentialsCache, "Gateway credentials cache", "Redis / in-memory cache", "Быстрая read-модель DSP credentials для проверки bid request на Gateway")
+Container(authCacheUpdater, "Auth Cache Updater", "Go worker", "Обновляет кэш Gateway по событиям изменения DSP credentials")
+
+Container(auctionService, "Сервис рекламного аукциона", "Go", "Выбирает победителя аукциона. Использует Redis вместо обращения к PostgreSQL в критическом пути")
+
+Container(deliveryService, "Delivery Service", "Go", "Формирует рекламный ответ и баннер")
+
+Container(campaignService, "Сервис кампаний", "Go", "Создание кампаний, ставки, таргетинг, статусы кампаний")
+ContainerDb(campaignDb, "campaign_db", "PostgreSQL", "Кампании, ставки, таргетинг")
+
+Container(statisticsService, "Сервис статистики", "Go", "Принимает показы, клики и конверсии")
+Container(statisticsWorker, "Обработчик статистики", "Go worker", "Читает события из Kafka и готовит данные для аналитики")
+
+Container(financeService, "Сервис финансов", "Go", "Балансы, списания, пополнения и счета")
+ContainerDb(billingDb, "billing_db", "PostgreSQL", "Балансы, списания, счета, история операций")
+
+Container(analyticsService, "Сервис аналитики", "Go", "Отдаёт отчёты рекламодателям")
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Данные для аналитики и отчётов")
+
+Container(cacheUpdater, "Cache Updater", "Go worker", "Обновляет Redis по событиям кампаний и бюджетов")
+ContainerDb(redis, "Redis", "Redis Cluster", "Быстрые данные для аукциона: активные кампании, ставки, бюджеты, таргетинг")
+ContainerQueue(kafka, "Kafka", "Apache Kafka", "События показов, кликов, конверсий, изменений кампаний, финансов и доступов")
+
+}
+
+Rel(dsp, gateway, "Рекламный запрос", "HTTPS / OpenRTB")
+Rel(user, gateway, "Показы и клики", "HTTPS")
+Rel(advertiser, gateway, "Управление кампаниями, бюджетами и отчётами", "HTTPS")
+Rel(admin, gateway, "Управление пользователями, ролями и DSP-партнёрами", "HTTPS")
+
+Rel(gateway, gatewayCredentialsCache, "Проверяет DSP credentials", "local cache lookup")
+Rel(gateway, auctionService, "Передаёт рекламный запрос", "gRPC")
+Rel(auctionService, redis, "Читает данные для аукциона", "Redis")
+Rel(auctionService, deliveryService, "Передаёт победителя аукциона", "gRPC")
+Rel(deliveryService, gateway, "Возвращает рекламный ответ", "HTTP")
+
+Rel(gateway, authService, "Login, refresh token, управление доступами", "REST")
+Rel(authService, authDb, "Читает и сохраняет пользователей, роли и ключи", "SQL")
+Rel(authService, kafka, "Публикует изменения DSP credentials и прав доступа", "Kafka")
+Rel(kafka, authCacheUpdater, "Читает события изменения доступов", "Kafka consumer")
+Rel(authCacheUpdater, gatewayCredentialsCache, "Обновляет read-модель DSP credentials", "cache update")
+
+Rel(gateway, campaignService, "Создание и изменение кампаний", "REST")
+Rel(campaignService, campaignDb, "Читает и сохраняет кампании", "SQL")
+Rel(campaignService, kafka, "Публикует изменения кампаний", "Kafka")
+Rel(kafka, cacheUpdater, "Читает изменения кампаний и бюджетов", "Kafka consumer")
+Rel(cacheUpdater, redis, "Обновляет данные для аукциона", "Redis")
+
+Rel(gateway, statisticsService, "Передаёт показы, клики и конверсии", "HTTP")
+Rel(statisticsService, kafka, "Публикует события статистики", "Kafka")
+Rel(kafka, statisticsWorker, "Читает события статистики", "Kafka consumer")
+Rel(statisticsWorker, clickhouse, "Записывает подготовленные данные", "SQL / batch insert")
+
+Rel(gateway, financeService, "Пополнение бюджета и финансовые операции", "REST")
+Rel(financeService, paymentGateway, "Проводит платёж", "HTTPS")
+Rel(financeService, billingDb, "Сохраняет балансы и операции", "SQL")
+Rel(financeService, kafka, "Публикует финансовые события и изменения бюджетов", "Kafka")
+
+Rel(gateway, analyticsService, "Запрос отчётов", "REST")
+Rel(analyticsService, clickhouse, "Читает данные для отчётов", "SQL")
+
+note right of gateway
+Gateway проверяет DSP credentials
+по локальному кэшу.
+
+Он не должен синхронно обращаться
+в Auth Service на каждый bid request,
+иначе это увеличит задержку
+в критическом пути.
+end note
+
+note right of authService
+Auth Service отвечает за пользователей,
+роли, JWT, refresh tokens
+и API keys для DSP-партнёров.
+
+Источник истины — auth_db.
+end note
+
+note right of auctionService
+Граница выделена из-за требования
+по времени ответа.
+
+Аукцион находится в критическом пути,
+поэтому он должен масштабироваться отдельно
+и не ждать PostgreSQL или Auth Service.
+end note
+
+note right of campaignService
+Граница выделена по бизнес-логике
+управления рекламными кампаниями.
+
+Кампании, ставки и таргетинг
+хранятся отдельно.
+end note
+
+note right of statisticsService
+Граница выделена из-за большого
+потока событий.
+
+Показы и клики не пишутся
+напрямую в PostgreSQL.
+end note
+
+note right of financeService
+Граница выделена из-за финансовой
+ответственности.
+
+Балансы и списания должны быть
+отделены от статистики и аналитики.
+
+Финансовые операции должны быть
+идемпотентными.
+end note
+
+note right of analyticsService
+Граница выделена из-за тяжёлых отчётов.
+
+Отчёты читаются из ClickHouse,
+а не из основной PostgreSQL.
+end note
+
+@enduml

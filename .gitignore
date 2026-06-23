@@ -1,0 +1,48 @@
+# IntelliJ IDEA / JetBrains
+
+.idea/
+*.iml
+*.iws
+
+# Default ignored files
+
+/shelf/
+/.idea/workspace.xml
+
+# Editor-based HTTP Client requests
+
+/httpRequests/
+
+# Datasource local storage ignored files
+
+/dataSources/
+/dataSources.local.xml
+
+# Zeppelin ignored files
+
+/ZeppelinRemoteNotebooks/
+
+# macOS
+
+.DS_Store
+
+# Build / temp files
+
+target/
+build/
+out/
+.tmp/
+temp/
+
+# Logs
+
+*.log
+
+# Environment / secrets
+
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.jks

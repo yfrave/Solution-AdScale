@@ -1,0 +1,129 @@
+@startuml Kafka_Streaming
+
+!include style/container/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title Task3 — Kafka Event Streaming для AdScale
+
+System_Boundary(producers, "Producers") {
+Container(auth, "Auth Service", "Go", "Публикует изменения пользователей, ролей и DSP credentials")
+Container(bidding, "Bidding Service", "Go", "Публикует события ставок")
+Container(tracking, "Tracking / Statistics Service", "Go", "Публикует показы, клики и конверсии")
+Container(campaign, "Campaign Service", "Go", "Публикует изменения кампаний")
+Container(billing, "Billing Service", "Go", "Публикует изменения бюджетов и финансовые события")
+}
+
+System_Boundary(kafkaBoundary, "Kafka Topics") {
+ContainerQueue(authEvents, "auth-events", "Kafka topic", "key: user_id / dsp_id, retention: 30-90 days")
+ContainerQueue(bidEvents, "bid-events", "Kafka topic", "key: request_id / dsp_id, retention: 7 days")
+ContainerQueue(impressionEvents, "impression-events", "Kafka topic", "key: campaign_id, retention: 14-30 days")
+ContainerQueue(clickEvents, "click-events", "Kafka topic", "key: campaign_id, retention: 14-30 days")
+ContainerQueue(conversionEvents, "conversion-events", "Kafka topic", "key: campaign_id, retention: 30 days")
+ContainerQueue(campaignEvents, "campaign-events", "Kafka topic", "key: campaign_id, retention: 30-90 days")
+ContainerQueue(budgetEvents, "budget-events", "Kafka topic", "key: advertiser_id, retention: 30-90 days")
+ContainerQueue(billingEvents, "billing-events", "Kafka topic", "key: operation_id, retention: 90+ days")
+ContainerQueue(dlqEvents, "dlq-events", "Kafka topic", "Ошибочные события после retry")
+}
+
+System_Boundary(consumers, "Consumers") {
+Container(authCacheUpdater, "auth-cache-updater-group", "Go consumer group", "Обновляет кэш DSP credentials на Gateway")
+Container(cacheUpdater, "cache-updater-group", "Go consumer group", "Обновляет Redis для Bidding Service")
+Container(statsWorker, "statistics-worker-group", "Go consumer group", "Готовит статистику и пишет данные в ClickHouse")
+Container(billingWorker, "billing-worker-group", "Go consumer group", "Обрабатывает финансовые события")
+Container(analyticsLoader, "analytics-loader-group", "Go consumer group", "Загружает данные для отчётов")
+Container(monitoring, "monitoring-group", "Go consumer group", "Считает технические метрики")
+Container(dlqHandler, "dlq-handler-group", "Go consumer group", "Разбирает ошибочные события")
+}
+
+System_Boundary(storages, "Storages") {
+ContainerDb(gatewayCredentialsCache, "Gateway credentials cache", "In-memory cache", "Read-модель DSP credentials для быстрой проверки bid request на Gateway")
+ContainerDb(redis, "Redis Cluster", "Redis", "Read-модель для Bidding Service")
+ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Аналитика и отчёты")
+ContainerDb(billingDb, "billing_db", "PostgreSQL", "Финансовые операции")
+}
+
+Rel(auth, authEvents, "user.changed, role.changed, auth.credentials.changed", "Kafka")
+Rel(bidding, bidEvents, "bid.request.received, bid.response.sent, bid.no_bid, bid.error", "Kafka")
+Rel(tracking, impressionEvents, "impression.created", "Kafka")
+Rel(tracking, clickEvents, "click.created", "Kafka")
+Rel(tracking, conversionEvents, "conversion.created", "Kafka")
+
+Rel(campaign, campaignEvents, "campaign.created, campaign.updated, campaign.paused, campaign.deleted", "Kafka")
+Rel(billing, budgetEvents, "budget.changed", "Kafka")
+Rel(billing, billingEvents, "payment.completed, payment.failed, money.charged, invoice.created", "Kafka")
+
+Rel(authEvents, authCacheUpdater, "consume", "Kafka")
+Rel(authCacheUpdater, gatewayCredentialsCache, "Обновляет DSP credentials read-model", "cache update")
+
+Rel(campaignEvents, cacheUpdater, "consume", "Kafka")
+Rel(budgetEvents, cacheUpdater, "consume", "Kafka")
+Rel(cacheUpdater, redis, "Обновляет campaign/budget cache", "Redis")
+
+Rel(bidEvents, statsWorker, "consume", "Kafka")
+Rel(impressionEvents, statsWorker, "consume", "Kafka")
+Rel(clickEvents, statsWorker, "consume", "Kafka")
+Rel(conversionEvents, statsWorker, "consume", "Kafka")
+Rel(statsWorker, clickhouse, "Записывает подготовленную статистику", "SQL / batch insert")
+
+Rel(impressionEvents, billingWorker, "consume", "Kafka")
+Rel(clickEvents, billingWorker, "consume", "Kafka")
+Rel(billingEvents, billingWorker, "consume", "Kafka")
+Rel(billingWorker, billingDb, "Идемпотентная обработка", "SQL")
+
+Rel(bidEvents, analyticsLoader, "consume", "Kafka")
+Rel(impressionEvents, analyticsLoader, "consume", "Kafka")
+Rel(clickEvents, analyticsLoader, "consume", "Kafka")
+Rel(conversionEvents, analyticsLoader, "consume", "Kafka")
+Rel(analyticsLoader, clickhouse, "Загружает данные для отчётов", "SQL / batch insert")
+
+Rel(authEvents, monitoring, "consume", "Kafka")
+Rel(bidEvents, monitoring, "consume", "Kafka")
+Rel(impressionEvents, monitoring, "consume", "Kafka")
+Rel(clickEvents, monitoring, "consume", "Kafka")
+Rel(campaignEvents, monitoring, "consume", "Kafka")
+Rel(budgetEvents, monitoring, "consume", "Kafka")
+Rel(billingEvents, monitoring, "consume", "Kafka")
+
+Rel(authEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(bidEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(impressionEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(clickEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(campaignEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(budgetEvents, dlqEvents, "failed after retry", "Kafka")
+Rel(billingEvents, dlqEvents, "failed after retry", "Kafka")
+
+Rel(dlqEvents, dlqHandler, "Разбор ошибок", "Kafka")
+
+note bottom of kafkaBoundary
+Формат событий: JSON Schema.
+
+Общие поля:
+event_id, event_type,
+event_version, occurred_at,
+producer, correlation_id, payload.
+end note
+
+note right of authCacheUpdater
+Auth events обновляют кэш Gateway.
+
+Gateway не должен синхронно обращаться
+в Auth Service на каждый bid request.
+end note
+
+note right of billingWorker
+Финансовые события
+обрабатываются идемпотентно.
+
+operation_id защищает
+от повторного списания.
+end note
+
+note bottom of dlqEvents
+DLQ нужен, чтобы одно плохое
+событие не блокировало
+обработку всего потока.
+end note
+
+@enduml
